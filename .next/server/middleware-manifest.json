@@ -1,0 +1,23 @@
+{
+  "sortedMiddleware": [],
+  "middleware": {},
+  "functions": {
+    "/api/gemini": {
+      "files": [
+        "server/edge-runtime-webpack.js",
+        "server/pages/api/gemini.js"
+      ],
+      "name": "pages/api/gemini",
+      "page": "/api/gemini",
+      "matchers": [
+        {
+          "regexp": "^/api/gemini$",
+          "originalSource": "/api/gemini"
+        }
+      ],
+      "wasm": [],
+      "assets": []
+    }
+  },
+  "version": 2
+}
