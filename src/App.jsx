@@ -66,7 +66,7 @@ const callGeminiJson = async (prompt, systemInstruction = "") => {
   }
 };
 
-const callGeminiStream = async (prompt, systemInstruction = "", onChunk) => {
+const callGeminiStream = async (history, systemInstruction = "", onChunk) => {
   try {
     const response = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-preview:streamGenerateContent?alt=sse&key=${apiKey}`,
@@ -74,7 +74,10 @@ const callGeminiStream = async (prompt, systemInstruction = "", onChunk) => {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
+          contents: history.map(msg => ({
+            role: msg.role === 'assistant' ? 'model' : 'user',
+            parts: [{ text: msg.text }]
+          })),
           systemInstruction: { parts: [{ text: systemInstruction }] },
           generationConfig: {
             thinkingConfig: { thinkingLevel: "low" }
@@ -571,9 +574,13 @@ const QuizSection = () => {
   const generateNewQuestion = async () => {
     if (!apiKey) { alert("请先配置 API Key 才能使用 AI 出题功能。"); return; }
     setLoadingQuestion(true);
-    const prompt = `生成一个关于高中对数函数(logarithmic functions)的单项选择题。请返回纯 JSON 格式。格式：{"question": "题目(LaTeX)", "options": ["A", "B", "C", "D"], "correct": 0, "explanation": "解析(LaTeX)"}`;
+    const prompt = `生成3道关于高中对数函数(logarithmic functions)的单项选择题，难度递增。请返回纯 JSON 数组格式。格式：[{"question": "题目(LaTeX)", "options": ["A", "B", "C", "D"], "correct": 0, "explanation": "解析(LaTeX)"}, ...]`;
     const result = await callGeminiJson(prompt);
-    if (result) setQuestions(prev => [...prev, { id: Date.now(), ...result }]);
+    if (result && Array.isArray(result)) {
+      setQuestions(result.map((q, index) => ({ id: Date.now() + index, ...q })));
+      setAnswers({}); // Reset answers when new questions load
+      setShowResult(false);
+    }
     setLoadingQuestion(false);
   };
 
@@ -638,14 +645,15 @@ const AITutorSection = () => {
     // Initial empty assistant message
     setMessages(prev => [...prev, { role: 'assistant', text: "" }]);
 
-    const systemPrompt = `你是一位精炼的高中数学辅导助手，专注于“对数函数”答疑。
-    **核心原则：极简、直观、准确**
-    1. **拒绝废话**：开场白不超过一句话，直接回答核心问题。
-    2. **结构化输出**：必须使用 Markdown 列表（- 或 1.）呈现知识点。
-    3. **公式规范**：数学公式**必须**包裹在单个对应的 $ 符号中（如 $\\log_a x$），禁止裸写公式。
-    4. **排版整洁**：段落之间必须空一行。`;
+    const systemPrompt = `你是一位专业的苏格拉底式学习辅导老师。
+你的核心原则是：永远不要直接把答案喂给学生，而是通过提问引导他们自己找到答案。
+当学生提出问题时，你要：
+1. 评估他们当前的理解水平（初三到高三之间）。
+2. 提供提示或将其分解为更小的步骤。
+3. 当他们答对时给予积极的肯定。
+4. 如果他们完全卡住了，再提供稍微具体的线索。`;
 
-    await callGeminiStream(input, systemPrompt, (chunk) => {
+    await callGeminiStream([...messages, userMsg], systemPrompt, (chunk) => {
       setMessages(prev => {
         const newMsgs = [...prev];
         const lastIndex = newMsgs.length - 1;
