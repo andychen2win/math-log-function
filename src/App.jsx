@@ -15,13 +15,19 @@ const apiKey = import.meta.env.VITE_GEMINI_API_KEY || "";
 const callGemini = async (prompt, systemInstruction = "") => {
   try {
     const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-preview:generateContent?key=${apiKey}`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           contents: [{ parts: [{ text: prompt }] }],
           systemInstruction: { parts: [{ text: systemInstruction }] },
+          // Gemini 3.0 建议：
+          // 1. 使用 thinkingLevel: "high" (默认值) 来获得最强的推理能力，特别适合数学辅导。
+          // 2. 保持 temperature 为默认值 (1.0)，不要随意降低，以免破坏推理链。
+          generationConfig: {
+            thinkingConfig: { thinkingLevel: "high" }
+          }
         }),
       }
     );
@@ -37,14 +43,17 @@ const callGemini = async (prompt, systemInstruction = "") => {
 const callGeminiJson = async (prompt, systemInstruction = "") => {
   try {
     const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-preview:generateContent?key=${apiKey}`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           contents: [{ parts: [{ text: prompt }] }],
           systemInstruction: { parts: [{ text: systemInstruction }] },
-          generationConfig: { responseMimeType: "application/json" }
+          generationConfig: {
+            responseMimeType: "application/json",
+            thinkingConfig: { thinkingLevel: "low" }
+          }
         }),
       }
     );
@@ -54,6 +63,63 @@ const callGeminiJson = async (prompt, systemInstruction = "") => {
   } catch (error) {
     console.error("Gemini API JSON call failed:", error);
     return null;
+  }
+};
+
+const callGeminiStream = async (prompt, systemInstruction = "", onChunk) => {
+  try {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-preview:streamGenerateContent?alt=sse&key=${apiKey}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          systemInstruction: { parts: [{ text: systemInstruction }] },
+          generationConfig: {
+            thinkingConfig: { thinkingLevel: "low" }
+          }
+        }),
+      }
+    );
+
+    if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      const chunk = decoder.decode(value, { stream: true });
+      buffer += chunk;
+
+      let lines = buffer.split("\n");
+      buffer = lines.pop(); // Keep the last incomplete line in the buffer
+
+      for (const line of lines) {
+        const trimmedLine = line.trim();
+        if (trimmedLine.startsWith("data: ")) {
+          try {
+            const jsonStr = trimmedLine.slice(6);
+            if (jsonStr === "[DONE]") continue;
+
+            const data = JSON.parse(jsonStr);
+            if (data.candidates && data.candidates[0].content && data.candidates[0].content.parts) {
+              const text = data.candidates[0].content.parts[0].text;
+              if (text) onChunk(text);
+            }
+          } catch (e) {
+            // Ignore parse errors
+          }
+        }
+      }
+    }
+  } catch (error) {
+    console.error("Gemini API stream call failed:", error);
+    onChunk("\n[网络错误，请稍后再试]");
   }
 };
 
@@ -559,38 +625,67 @@ const AITutorSection = () => {
   const [isLoading, setIsLoading] = useState(false);
   const messagesEndRef = useRef(null);
   useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
+
   const handleSend = async () => {
     if (!apiKey) { alert("请先配置 API Key。"); return; }
     if (!input.trim()) return;
+
     const userMsg = { role: 'user', text: input };
     setMessages(prev => [...prev, userMsg]);
     setInput('');
     setIsLoading(true);
-    const systemPrompt = `你是一位和蔼可亲的中国高中数学老师，专门负责讲解“对数函数”这一章。所有数学公式请务必使用LaTeX格式，并用单个 $ 符号包裹，例如 $y=\\log_a x$。`;
-    const replyText = await callGemini(input, systemPrompt);
-    setMessages(prev => [...prev, { role: 'assistant', text: replyText || "抱歉，老师刚才走神了，请你再说一遍好吗？" }]);
+
+    // Initial empty assistant message
+    setMessages(prev => [...prev, { role: 'assistant', text: "" }]);
+
+    const systemPrompt = `你是一位精炼的高中数学辅导助手，专注于“对数函数”答疑。
+    **核心原则：极简、直观、准确**
+    1. **拒绝废话**：开场白不超过一句话，直接回答核心问题。
+    2. **结构化输出**：必须使用 Markdown 列表（- 或 1.）呈现知识点。
+    3. **公式规范**：数学公式**必须**包裹在单个对应的 $ 符号中（如 $\\log_a x$），禁止裸写公式。
+    4. **排版整洁**：段落之间必须空一行。`;
+
+    await callGeminiStream(input, systemPrompt, (chunk) => {
+      setMessages(prev => {
+        const newMsgs = [...prev];
+        const lastIndex = newMsgs.length - 1;
+        const lastMsg = newMsgs[lastIndex];
+
+        // Fix: Create a shallow copy of the last message object before mutation
+        // This prevents duplication issues in React Strict Mode where updaters run twice
+        if (lastMsg.role === 'assistant') {
+          newMsgs[lastIndex] = {
+            ...lastMsg,
+            text: lastMsg.text + chunk
+          };
+        }
+        return newMsgs;
+      });
+    });
+
     setIsLoading(false);
   };
+
   return (
     <div className="bg-white rounded-xl shadow-lg border border-indigo-100 flex flex-col h-[600px] animate-in fade-in zoom-in-95 duration-500 overflow-hidden">
       <div className="p-4 bg-gradient-to-r from-indigo-600 to-purple-600 text-white flex items-center gap-3">
         <div className="p-2 bg-white/20 rounded-full backdrop-blur-sm"><Bot className="w-6 h-6 text-white" /></div>
-        <div><h3 className="font-bold text-lg">AI 智能助教</h3><p className="text-indigo-100 text-xs opacity-90">基于 Gemini 模型 • 24小时在线答疑</p></div>
+        <div><h3 className="font-bold text-lg">AI 智能助教</h3><p className="text-indigo-100 text-xs opacity-90">7*24小时回答问题</p></div>
       </div>
       <div className="flex-1 overflow-y-auto p-4 space-y-4 bg-slate-50">
         {messages.map((msg, idx) => (
           <div key={idx} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-            <div className={`max-w-[85%] p-3.5 rounded-2xl shadow-sm text-sm md:text-base leading-relaxed ${msg.role === 'user' ? 'bg-indigo-600 text-white rounded-br-none' : 'bg-white text-slate-700 border border-slate-200 rounded-bl-none'}`}>
+            <div className={`max-w-[85%] p-3.5 rounded-2xl shadow-sm text-sm md:text-base leading-relaxed whitespace-pre-wrap ${msg.role === 'user' ? 'bg-indigo-600 text-white rounded-br-none' : 'bg-white text-slate-700 border border-slate-200 rounded-bl-none'}`}>
               {msg.role === 'assistant' ? <MathText>{msg.text}</MathText> : <span>{msg.text}</span>}
             </div>
           </div>
         ))}
-        {isLoading && <div className="flex justify-start"><div className="bg-white p-4 rounded-2xl rounded-bl-none shadow-sm border border-slate-200 flex items-center gap-2"><Loader2 className="w-4 h-4 animate-spin text-indigo-500" /><span className="text-sm text-slate-500">老师正在思考中...</span></div></div>}
+        {isLoading && messages[messages.length - 1].text === "" && <div className="flex justify-start"><div className="bg-white p-4 rounded-2xl rounded-bl-none shadow-sm border border-slate-200 flex items-center gap-2"><Loader2 className="w-4 h-4 animate-spin text-indigo-500" /><span className="text-sm text-slate-500">老师正在思考中...</span></div></div>}
         <div ref={messagesEndRef} />
       </div>
       <div className="p-4 bg-white border-t border-slate-200">
         <div className="flex gap-2">
-          <input type="text" value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && handleSend()} placeholder="输入你的问题..." className="flex-1 px-4 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 transition bg-slate-50" />
+          <input type="text" value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && !isLoading && handleSend()} placeholder="输入你的问题..." className="flex-1 px-4 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 transition bg-slate-50" />
           <button onClick={handleSend} disabled={isLoading || !input.trim()} className="bg-indigo-600 text-white p-2 rounded-lg hover:bg-indigo-700 disabled:opacity-50 transition shadow-sm"><Send className="w-5 h-5" /></button>
         </div>
       </div>
